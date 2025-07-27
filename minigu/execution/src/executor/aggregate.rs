@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float32Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, AsArray, ArrayRef, Float32Array, Float64Array, Int64Array, ListArray, StringArray};
+use arrow::datatypes::DataType;
 use minigu_common::data_chunk::DataChunk;
 use minigu_common::value::{ScalarValue, ScalarValueAccessor};
 
@@ -826,6 +827,9 @@ where
                     .collect();
 
                 let mut has_data = false;
+                // Find the index of the first unflat column to avoid repeated scanning
+                let mut unflat_col_idx: Option<usize> = None;
+                let mut is_unflat_col_idx_determined = false;
 
                 // Stream processing each chunk to avoid performance overhead of concat
                 for chunk in child.into_iter() {
@@ -834,13 +838,21 @@ where
                         continue;
                     }
 
+                    if !is_unflat_col_idx_determined {
+                        unflat_col_idx = chunk
+                            .columns()
+                            .iter()
+                            .position(|col| matches!(col.data_type(), DataType::List(_)));
+                        is_unflat_col_idx_determined = true;
+                    }
+
                     has_data = true;
 
                     // Process each row of the current chunk directly
                     for row in chunk.rows() {
                         for (i, spec) in aggregate_specs.iter().enumerate() {
                             // If there is an expression, evaluate it for the current row
-                            let value = if let Some(ref expr) = spec.expression {
+                            if let Some(ref expr) = spec.expression {
                                 // Create a single row data chunk for the current row
                                 let row_columns: Vec<ArrayRef> = chunk
                                     .columns()
@@ -848,15 +860,40 @@ where
                                     .map(|col| col.slice(row.row_index(), 1))
                                     .collect();
                                 let row_chunk = DataChunk::new(row_columns);
-                                // Evaluate the expression for the current row
-                                let result = gen_try!(expr.evaluate(&row_chunk));
-                                let scalar_value = result.as_array().as_ref().index(0);
-                                Some(scalar_value)
+                                let result_datum = gen_try!(expr.evaluate(&row_chunk));
+                                let result_array = result_datum.as_array();
+
+                                if let DataType::List(_) = result_array.data_type() {
+                                    let list_array: &ListArray = result_array.as_list();
+                                    let inner_array = list_array.value(0);
+                                    // For unflat columns, iterate through all elements in the list
+                                    for j in 0..inner_array.len() {
+                                        let scalar_value = inner_array.index(j);
+                                        gen_try!(states[i].update(Some(scalar_value)));
+                                    }
+                                } else {
+                                    // Flat column: original logic
+                                    let scalar_value = result_array.as_ref().index(0);
+                                    gen_try!(states[i].update(Some(scalar_value)));
+                                }
                             } else {
-                                Some(ScalarValue::Int64(Some(1))) // COUNT(*)
+                                // COUNT(*)
+                                // Check if there's any unflat column to count elements from
+                                if let Some(idx) = unflat_col_idx {
+                                    let unflat_column = &chunk.columns()[idx];
+                                    // Found unflat column, count each element
+                                    let list_array: &ListArray = unflat_column.as_list();
+                                    let inner_array = list_array.value(row.row_index());
+                                    for _ in 0..inner_array.len() {
+                                        let value = Some(ScalarValue::Int64(Some(1)));
+                                        gen_try!(states[i].update(value));
+                                    }
+                                } else {
+                                    // No unflat column found, count once per row (normal behavior)
+                                    let value = Some(ScalarValue::Int64(Some(1)));
+                                    gen_try!(states[i].update(value));
+                                }
                             };
-                            // Update the aggregate state for the current row
-                            gen_try!(states[i].update(value));
                         }
                     }
                 }
@@ -906,12 +943,25 @@ where
                 // Grouped aggregation
                 let mut groups: HashMap<Vec<ScalarValue>, Vec<AggregateState>> = HashMap::new();
                 let mut has_data = false;
+                // Find the index of the first unflat column to avoid repeated scanning
+                let mut unflat_col_idx: Option<usize> = None;
+                let mut is_unflat_col_idx_determined = false;
 
                 // Stream processing each chunk to avoid performance overhead of concat
                 for chunk in child.into_iter() {
                     let chunk = gen_try!(chunk);
                     if chunk.is_empty() {
                         continue;
+                    }
+
+                    if !is_unflat_col_idx_determined {
+                        unflat_col_idx = chunk
+                            .columns()
+                            .iter()
+                            .skip(group_by_expressions.len())
+                            .position(|col| matches!(col.data_type(), DataType::List(_)))
+                            .map(|i| i + group_by_expressions.len());
+                        is_unflat_col_idx_determined = true;
                     }
 
                     has_data = true;
@@ -943,7 +993,7 @@ where
 
                         // Update the aggregate state for the current row
                         for (i, spec) in aggregate_specs.iter().enumerate() {
-                            let value = if let Some(ref expr) = spec.expression {
+                            if let Some(ref expr) = spec.expression {
                                 // Create a single row data chunk for the current row
                                 let row_columns: Vec<ArrayRef> = chunk
                                     .columns()
@@ -951,14 +1001,40 @@ where
                                     .map(|col| col.slice(row.row_index(), 1))
                                     .collect();
                                 let row_chunk = DataChunk::new(row_columns);
-                                let result = gen_try!(expr.evaluate(&row_chunk));
-                                let scalar_value = result.as_array().as_ref().index(0);
-                                Some(scalar_value)
-                            } else {
-                                Some(ScalarValue::Int64(Some(1))) // COUNT(*)
-                            };
+                                let result_datum = gen_try!(expr.evaluate(&row_chunk));
+                                let result_array = result_datum.as_array();
 
-                            gen_try!(states[i].update(value));
+                                if let DataType::List(_) = result_array.data_type() {
+                                    let list_array: &ListArray = result_array.as_list();
+                                    let inner_array = list_array.value(0);
+                                    // For unflat columns, iterate through all elements in the list
+                                    for j in 0..inner_array.len() {
+                                        let scalar_value = inner_array.index(j);
+                                        gen_try!(states[i].update(Some(scalar_value)));
+                                    }
+                                } else {
+                                    // Flat column: original logic
+                                    let scalar_value = result_array.as_ref().index(0);
+                                    gen_try!(states[i].update(Some(scalar_value)));
+                                }
+                            } else {
+                                // COUNT(*)
+                                // Check if there's any unflat column to count elements from
+                                if let Some(idx) = unflat_col_idx {
+                                    let unflat_column = &chunk.columns()[idx];
+                                    // Found unflat column, count each element
+                                    let list_array: &ListArray = unflat_column.as_list();
+                                    let inner_array = list_array.value(row.row_index());
+                                    for _ in 0..inner_array.len() {
+                                        let value = Some(ScalarValue::Int64(Some(1)));
+                                        gen_try!(states[i].update(value));
+                                    }
+                                } else {
+                                    // No unflat column found, count once per row (normal behavior)
+                                    let value = Some(ScalarValue::Int64(Some(1)));
+                                    gen_try!(states[i].update(value));
+                                }
+                            };
                         }
                     }
                 }
@@ -1023,6 +1099,8 @@ mod tests {
     use minigu_common::data_chunk;
     use minigu_common::data_chunk::DataChunk;
     use minigu_common::value::F64;
+    use arrow::array::{Int32Builder, ListBuilder};
+    use arrow::datatypes::{DataType as ArrowDataType, Field};
 
     use super::*;
     use crate::evaluator::Evaluator;
@@ -1705,5 +1783,91 @@ mod tests {
         let result_columns = result_int32.columns();
         assert_eq!(result_columns.len(), 1);
         assert!(result_columns[0].as_any().is::<Float64Array>());
+    }
+
+    #[test]
+    fn test_unflat_aggregate() {
+        // department_id: [1, 2, 1]
+        // salaries (un-flat): [[5000, 6000], [4000, 4500], [5500]]
+        let salaries_col = {
+            let field = Field::new_list_field(ArrowDataType::Int32, true);
+            let mut builder = ListBuilder::new(Int32Builder::new()).with_field(Arc::new(field));
+            builder.append_value([Some(5000), Some(6000)]);
+            builder.append_value([Some(4000), Some(4500)]);
+            builder.append_value([Some(5500)]);
+            Arc::new(builder.finish())
+        };
+
+        let chunk = DataChunk::new(vec![
+            Arc::new(Int64Array::from(vec![1, 2, 1])),
+            salaries_col,
+        ]);
+
+        let result: DataChunk = [Ok(chunk)]
+            .into_executor()
+            .aggregate(
+                vec![
+                    AggregateSpec::count(),
+                    AggregateSpec::count_expression(Box::new(ColumnRef::new(1)), false),
+                    AggregateSpec::sum(Box::new(ColumnRef::new(1)), false),
+                    AggregateSpec::avg(Box::new(ColumnRef::new(1)), false),
+                    AggregateSpec::min(Box::new(ColumnRef::new(1))),
+                    AggregateSpec::max(Box::new(ColumnRef::new(1))),
+                ],
+                vec![Box::new(ColumnRef::new(0))],
+                vec![],
+            )
+            .into_iter()
+            .try_collect()
+            .unwrap();
+
+        // Expected results:
+        // Dept 1:
+        // - COUNT(*): 3 (from [5000, 6000] and [5500])
+        // - COUNT(salaries): 3 (from [5000, 6000] and [5500])
+        // - SUM: 16500 (5000 + 6000 + 5500)
+        // - AVG: 5500 (16500 / 3)
+        // - MIN: 5000
+        // - MAX: 6000
+        // Dept 2:
+        // - COUNT(*): 2 (from [4000, 4500])
+        // - COUNT(salaries): 2 (from [4000, 4500])
+        // - SUM: 8500 (4000 + 4500)
+        // - AVG: 4250 (8500 / 2)
+        // - MIN: 4000
+        // - MAX: 4500
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.columns().len(), 7); // 1 group column + 6 aggregate columns
+
+        let dept_col = result.columns()[0].as_any().downcast_ref::<Int64Array>().unwrap();
+        let count_star_col = result.columns()[1].as_any().downcast_ref::<Int64Array>().unwrap();
+        let count_col = result.columns()[2].as_any().downcast_ref::<Int64Array>().unwrap();
+        let sum_col = result.columns()[3].as_any().downcast_ref::<Int64Array>().unwrap();
+        let avg_col = result.columns()[4].as_any().downcast_ref::<Float64Array>().unwrap();
+        let min_col = result.columns()[5].as_any().downcast_ref::<Int64Array>().unwrap();
+        let max_col = result.columns()[6].as_any().downcast_ref::<Int64Array>().unwrap();
+
+        for i in 0..result.len() {
+            let dept_id = dept_col.value(i);
+            match dept_id {
+                1 => {
+                    assert_eq!(count_star_col.value(i), 3);
+                    assert_eq!(count_col.value(i), 3);
+                    assert_eq!(sum_col.value(i), 16500);
+                    assert!((avg_col.value(i) - 5500.0).abs() < 0.01);
+                    assert_eq!(min_col.value(i), 5000);
+                    assert_eq!(max_col.value(i), 6000);
+                }
+                2 => {
+                    assert_eq!(count_star_col.value(i), 2);
+                    assert_eq!(count_col.value(i), 2);
+                    assert_eq!(sum_col.value(i), 8500);
+                    assert!((avg_col.value(i) - 4250.0).abs() < 0.01);
+                    assert_eq!(min_col.value(i), 4000);
+                    assert_eq!(max_col.value(i), 4500);
+                }
+                _ => panic!("Unexpected department id: {}", dept_id),
+            }
+        }
     }
 }
