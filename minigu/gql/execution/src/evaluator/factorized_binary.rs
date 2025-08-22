@@ -251,10 +251,10 @@ mod tests {
         };
         let chunk = DataChunk::new(vec![c0]);
         // c0 * 3 + 1
-        let c0_mul_3_plus_2 = ColumnRef::new(0)
+        let c0_mul_3_plus_1 = ColumnRef::new(0)
             .factorized_mul(Constant::new(3i32.into()), UnflatSide::Left)
             .factorized_add(Constant::new(1i32.into()), UnflatSide::Left);
-        let result = c0_mul_3_plus_2.evaluate(&chunk).unwrap();
+        let result = c0_mul_3_plus_1.evaluate(&chunk).unwrap();
         let expected: ArrayRef = {
             let field = Field::new_list_field(DataType::Int32, true);
             let mut builder = ListBuilder::new(Int32Builder::new()).with_field(Arc::new(field));
