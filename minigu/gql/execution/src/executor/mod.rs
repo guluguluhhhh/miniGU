@@ -156,6 +156,29 @@ pub trait Executor {
     {
         LimitBuilder::new(self, limit).into_executor()
     }
+
+    /// Convert this Executor into a FactorizedExecutor.
+    ///
+    /// This method acts as a bridge between traditional DataChunk-based executors
+    /// and ResultSet-based factorized executors. Each row from the upstream DataChunk
+    /// is converted into an independent ResultSet.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use minigu_execution::executor::Executor;
+    /// use minigu_execution::factorized_executor::FactorizedExecutor;
+    ///
+    /// let factorized_executor = some_executor
+    ///     .factorized_transfer()
+    ///     .factorized_expand(source, pos, col_idx);
+    /// ```
+    fn factorized_transfer(self) -> impl crate::factorized_executor::FactorizedExecutor
+    where
+        Self: Sized,
+    {
+        use crate::factorized_executor::IntoFactorizedExecutor;
+        crate::factorized_executor::FactorizedTransferBuilder::new(self).into_factorized_executor()
+    }
 }
 
 /// Conversion into an [`Executor`].

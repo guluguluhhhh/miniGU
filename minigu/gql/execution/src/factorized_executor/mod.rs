@@ -1,8 +1,10 @@
 pub mod factorized_expand;
 pub mod factorized_simple_aggregate;
+pub mod factorized_transfer;
 
 use factorized_expand::FactorizedExpandBuilder;
 use factorized_simple_aggregate::{FactorizedAggregateBuilder, SimpleAggregateSpec};
+pub use factorized_transfer::FactorizedTransferBuilder;
 use minigu_common::result_set::ResultSet;
 
 use crate::error::ExecutionResult;
