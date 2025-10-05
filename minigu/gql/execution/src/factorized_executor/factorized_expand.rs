@@ -1,6 +1,7 @@
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::compute;
 use minigu_common::data_chunk::DataChunk;
+use minigu_common::data_pos;
 use minigu_common::result_set::{DataChunkPos, DataPos};
 use minigu_common::types::VertexIdArray;
 
@@ -47,7 +48,7 @@ where
                 let mut result_set = gen_try!(result_set);
 
                 let col_to_expand =
-                    result_set.get_column(&DataPos::new(expand_chunk_pos, expand_col_idx));
+                    result_set.get_column(&data_pos!(expand_chunk_pos, expand_col_idx));
                 let input_column: VertexIdArray = col_to_expand.as_primitive().clone();
                 // Only non-nullable columns can be expanded.
                 assert!(
@@ -108,8 +109,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use minigu_common::data_chunk;
-    use minigu_common::result_set::{DataChunkPos, ResultSet};
+    use minigu_common::result_set::ResultSet;
+    use minigu_common::{data_chunk, result_set};
 
     use super::*;
     use crate::error::ExecutionResult;
@@ -144,8 +145,7 @@ mod tests {
 
         let mut chunk = data_chunk!((UInt64, [1u64, 3u64]));
         chunk.set_cur_idx(Some(0));
-        let mut input_result = ResultSet::new();
-        input_result.push(chunk.clone());
+        let input_result = result_set!(chunk.clone());
 
         let expand_executor = FactorizedExpandBuilder::new(
             MockInput(input_result),

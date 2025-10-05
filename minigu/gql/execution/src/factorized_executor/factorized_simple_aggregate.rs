@@ -1,4 +1,5 @@
 use minigu_common::data_chunk::DataChunk;
+use minigu_common::result_set;
 use minigu_common::result_set::{DataChunkPos, ResultSet};
 use minigu_common::value::ScalarValueAccessor;
 
@@ -171,13 +172,14 @@ where
 
                     match &spec.function {
                         AggregateFunction::Count => {
-                            // COUNT(*) counts total multiplicity across all chunks
-                            let all_chunks_in_scope: std::collections::HashSet<u32> =
-                                (0..result_set.num_data_chunks() as u32).collect();
-                            let total_multiplicity =
-                                result_set.get_num_tuples(&all_chunks_in_scope);
+                            // COUNT(*) counts total factor across all chunks
+                            let all_chunks_in_scope: std::collections::HashSet<DataChunkPos> = (0
+                                ..result_set.num_data_chunks())
+                                .map(DataChunkPos)
+                                .collect();
+                            let total_factor = result_set.get_num_tuples(&all_chunks_in_scope);
 
-                            for _ in 0..total_multiplicity {
+                            for _ in 0..total_factor {
                                 gen_try!(state.update(None));
                             }
                         }
@@ -206,9 +208,9 @@ where
                     let final_value = gen_try!(states[i].finalize());
                     result_columns.push(final_value.to_scalar_array());
                 }
-                let result_chunk = DataChunk::new(result_columns);
-                let mut result_set = ResultSet::new();
-                result_set.push(result_chunk);
+                let mut result_chunk = DataChunk::new(result_columns);
+                result_chunk.set_cur_idx(Some(0));
+                let result_set = result_set!(result_chunk);
                 yield Ok(result_set);
             } else {
                 // Return default values for empty input
@@ -231,9 +233,9 @@ where
                     result_columns.push(default_value);
                 }
                 if !result_columns.is_empty() {
-                    let result_chunk = DataChunk::new(result_columns);
-                    let mut result_set = ResultSet::new();
-                    result_set.push(result_chunk);
+                    let mut result_chunk = DataChunk::new(result_columns);
+                    result_chunk.set_cur_idx(Some(0));
+                    let result_set = result_set!(result_chunk);
                     yield Ok(result_set);
                 }
             }
@@ -253,19 +255,19 @@ fn process_aggregate(
 
     let payload_chunk = input.get_data_chunk(base_chunk_pos).unwrap();
 
-    // Calculate multiplicity from all chunks except the payload chunk
+    // Calculate factor from all chunks except the payload chunk
     let payload_chunk_idx = base_chunk_pos.0;
     let mut chunks_in_scope = std::collections::HashSet::new();
     for i in 0..input.num_data_chunks() {
         if i != payload_chunk_idx as usize {
-            chunks_in_scope.insert(i as u32);
+            chunks_in_scope.insert(DataChunkPos(i));
         }
     }
 
-    let multiplicity = if chunks_in_scope.is_empty() {
-        input.multiplicity
+    let factor = if chunks_in_scope.is_empty() {
+        input.factor
     } else {
-        input.get_num_tuples_without_multiplicity(&chunks_in_scope) * input.multiplicity
+        input.get_num_tuples_without_factor(&chunks_in_scope) * input.factor
     };
 
     // All non-COUNT(*) aggregates must provide an expression
@@ -288,7 +290,7 @@ fn process_aggregate(
             let scalar = result.as_array().as_ref().index(0);
 
             if !is_null_value(&scalar) {
-                for _ in 0..multiplicity {
+                for _ in 0..factor {
                     state.update(Some(scalar.clone()))?;
                 }
             }
@@ -306,7 +308,7 @@ fn process_aggregate(
         let scalar = result.as_array().as_ref().index(0);
 
         if !is_null_value(&scalar) {
-            for _ in 0..multiplicity {
+            for _ in 0..factor {
                 state.update(Some(scalar.clone()))?;
             }
         }
@@ -320,7 +322,6 @@ mod tests {
     use arrow::array::{Float64Array, Int64Array};
     use itertools::Itertools;
     use minigu_common::data_chunk;
-    use minigu_common::result_set::DataChunkPos;
     use minigu_common::value::ScalarValue;
 
     use super::*;
@@ -357,15 +358,11 @@ mod tests {
         //         [10, 20, 30]
         // Test COUNT(*) with one flat chunk (1 value) and one unflat chunk (3 values)
         // Expected result: 1 * 3 = 3
-        let mut result_set = ResultSet::new();
-
         let mut flat_chunk = data_chunk!((Int32, [1]));
         flat_chunk.set_cur_idx(Some(0));
-        result_set.push(flat_chunk);
-
         let mut unflat_chunk = data_chunk!((Int32, [10, 20, 30]));
         unflat_chunk.set_unflat();
-        result_set.push(unflat_chunk);
+        let result_set = result_set!(flat_chunk, unflat_chunk);
 
         let mock_input = MockFactorizedExecutor {
             result: result_set,
@@ -398,20 +395,14 @@ mod tests {
         //         [10, 20]
         // Test COUNT(*) with flat chunk (1 value at cursor 0) and two unflat chunks (3 values) x (2
         // values) Expected result: 1 * 3 * 2 = 6 (Cartesian product)
-        let mut result_set = ResultSet::new();
-
         // Add a flat chunk first
         let mut flat_chunk = data_chunk!((Int32, [100, 200, 300, 400]));
-        flat_chunk.set_cur_idx(Some(0)); // Set cursor to first element, so only contributes 1 to multiplicity
-        result_set.push(flat_chunk);
-
+        flat_chunk.set_cur_idx(Some(0)); // Set cursor to first element, so only contributes 1 to factor
         let mut unflat_chunk1 = data_chunk!((Int32, [1, 2, 3]));
         unflat_chunk1.set_unflat();
-        result_set.push(unflat_chunk1);
-
         let mut unflat_chunk2 = data_chunk!((Int32, [10, 20]));
         unflat_chunk2.set_unflat();
-        result_set.push(unflat_chunk2);
+        let result_set = result_set!(flat_chunk, unflat_chunk1, unflat_chunk2);
 
         let mock_input = MockFactorizedExecutor {
             result: result_set,
@@ -444,19 +435,13 @@ mod tests {
         //         [10, 20]
         // Test SUM with flat chunk (1 value), unflat chunk with values [1,2,3], unflat chunk (2
         // values) Direct SUM: (1+2+3) * 2 = 12, Expression SUM: (2+3+4) * 2 = 18
-        let mut result_set = ResultSet::new();
-
         let mut flat_chunk = data_chunk!((Int32, [1]));
         flat_chunk.set_cur_idx(Some(0));
-        result_set.push(flat_chunk);
-
         let mut unflat_chunk1 = data_chunk!((Int32, [1, 2, 3]));
         unflat_chunk1.set_unflat();
-        result_set.push(unflat_chunk1);
-
         let mut unflat_chunk2 = data_chunk!((Int32, [10, 20]));
         unflat_chunk2.set_unflat();
-        result_set.push(unflat_chunk2);
+        let result_set = result_set!(flat_chunk, unflat_chunk1, unflat_chunk2);
 
         let column_ref = ColumnRef::new(0);
         let add_one_expr = ColumnRef::new(0).add(Constant::new(ScalarValue::Int32(Some(1))));
@@ -501,19 +486,13 @@ mod tests {
         //         [10, 20, 30]
         // Test MIN with values [5,2,8,1] and expression (column*2)
         // Direct MIN: 1, Expression MIN: 2
-        let mut result_set = ResultSet::new();
-
         let mut flat_chunk = data_chunk!((Int32, [1]));
         flat_chunk.set_cur_idx(Some(0));
-        result_set.push(flat_chunk);
-
         let mut unflat_chunk1 = data_chunk!((Int32, [5, 2, 8, 1]));
         unflat_chunk1.set_unflat();
-        result_set.push(unflat_chunk1);
-
         let mut unflat_chunk2 = data_chunk!((Int32, [10, 20, 30]));
         unflat_chunk2.set_unflat();
-        result_set.push(unflat_chunk2);
+        let result_set = result_set!(flat_chunk, unflat_chunk1, unflat_chunk2);
 
         let column_ref = ColumnRef::new(0);
         let mul_two_expr = ColumnRef::new(0).mul(Constant::new(ScalarValue::Int32(Some(2))));
@@ -558,19 +537,13 @@ mod tests {
         //         [10, 20]
         // Test MAX with values [5,2,8,1] and expression (column+5)
         // Direct MAX: 8, Expression MAX: 13
-        let mut result_set = ResultSet::new();
-
         let mut flat_chunk = data_chunk!((Int32, [1]));
         flat_chunk.set_cur_idx(Some(0));
-        result_set.push(flat_chunk);
-
         let mut unflat_chunk1 = data_chunk!((Int32, [5, 2, 8, 1]));
         unflat_chunk1.set_unflat();
-        result_set.push(unflat_chunk1);
-
         let mut unflat_chunk2 = data_chunk!((Int32, [10, 20]));
         unflat_chunk2.set_unflat();
-        result_set.push(unflat_chunk2);
+        let result_set = result_set!(flat_chunk, unflat_chunk1, unflat_chunk2);
 
         let column_ref = ColumnRef::new(0);
         let add_five_expr = ColumnRef::new(0).add(Constant::new(ScalarValue::Int32(Some(5))));
@@ -615,19 +588,13 @@ mod tests {
         //         [10, 20]
         // Test AVG with values [2,4,6] and expression (column/2)
         // Direct AVG: (2+2+4+4+6+6)/6 = 4.0, Expression AVG: (1+1+2+2+3+3)/6 = 2.0
-        let mut result_set = ResultSet::new();
-
         let mut flat_chunk = data_chunk!((Int32, [1]));
         flat_chunk.set_cur_idx(Some(0));
-        result_set.push(flat_chunk);
-
         let mut unflat_chunk1 = data_chunk!((Int32, [2, 4, 6]));
         unflat_chunk1.set_unflat();
-        result_set.push(unflat_chunk1);
-
         let mut unflat_chunk2 = data_chunk!((Int32, [10, 20]));
         unflat_chunk2.set_unflat();
-        result_set.push(unflat_chunk2);
+        let result_set = result_set!(flat_chunk, unflat_chunk1, unflat_chunk2);
 
         let column_ref = ColumnRef::new(0);
         let div_two_expr = ColumnRef::new(0).div(Constant::new(ScalarValue::Int32(Some(2))));
@@ -672,19 +639,13 @@ mod tests {
         //         [10, 20, 30]
         // Test multiple aggregates with values [1,2,3] and various expressions
         // COUNT: 9, SUM: 18, SUM(col+10): 108, MIN: 1, MAX(col*5): 15, AVG: 2.0
-        let mut result_set = ResultSet::new();
-
         let mut flat_chunk = data_chunk!((Int32, [1]));
         flat_chunk.set_cur_idx(Some(0));
-        result_set.push(flat_chunk);
-
         let mut unflat_chunk1 = data_chunk!((Int32, [1, 2, 3]));
         unflat_chunk1.set_unflat();
-        result_set.push(unflat_chunk1);
-
         let mut unflat_chunk2 = data_chunk!((Int32, [10, 20, 30]));
         unflat_chunk2.set_unflat();
-        result_set.push(unflat_chunk2);
+        let result_set = result_set!(flat_chunk, unflat_chunk1, unflat_chunk2);
 
         let column_ref = ColumnRef::new(0);
         let add_ten_expr = ColumnRef::new(0).add(Constant::new(ScalarValue::Int32(Some(10))));
