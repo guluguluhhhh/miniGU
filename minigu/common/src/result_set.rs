@@ -14,20 +14,11 @@ pub struct DataPos {
     pub column_pos: usize,
 }
 
-impl DataPos {
-    pub fn new(data_chunk_pos: DataChunkPos, column_pos: usize) -> Self {
-        Self {
-            data_chunk_pos,
-            column_pos,
-        }
-    }
-}
-
 /// A collection of DataChunks representing factorized query results
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResultSet {
-    /// Multiplicity factor for tuple counts
-    pub multiplicity: u64,
+    /// factor for tuple counts
+    pub factor: u64,
     /// Vector of DataChunks containing the actual data
     data_chunks: Vec<Arc<DataChunk>>,
 }
@@ -36,7 +27,7 @@ impl ResultSet {
     #[inline]
     pub fn new() -> Self {
         Self {
-            multiplicity: 1,
+            factor: 1,
             data_chunks: Vec::new(),
         }
     }
@@ -83,7 +74,7 @@ impl ResultSet {
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            multiplicity: 1,
+            factor: 1,
             data_chunks: Vec::with_capacity(capacity),
         }
     }
@@ -108,13 +99,13 @@ impl ResultSet {
         &chunk.columns()[data_pos.column_pos]
     }
 
-    /// Get the total number of tuples in the specified data chunks without considering base multiplicity
+    /// Get the total number of tuples in the specified data chunks without considering base factor
     /// For unflat chunks, this computes the Cartesian product size
     /// For flat chunks, pass
     #[inline]
-    pub fn get_num_tuples_without_multiplicity(
+    pub fn get_num_tuples_without_factor(
         &self,
-        data_chunks_pos_in_scope: &HashSet<u32>,
+        data_chunks_pos_in_scope: &HashSet<DataChunkPos>,
     ) -> u64 {
         assert!(
             !data_chunks_pos_in_scope.is_empty(),
@@ -124,7 +115,7 @@ impl ResultSet {
         let mut num_tuples = 1u64;
 
         for &data_chunk_pos in data_chunks_pos_in_scope {
-            if let Some(chunk) = self.data_chunks.get(data_chunk_pos as usize) {
+            if let Some(chunk) = self.data_chunks.get(data_chunk_pos.0) {
                 if chunk.is_unflat() {
                     // Only unflat chunks participate in Cartesian product
                     num_tuples *= chunk.cardinality() as u64;
@@ -136,10 +127,10 @@ impl ResultSet {
         num_tuples
     }
 
-    /// Get the total number of tuples in the specified data chunks considering multiplicity
+    /// Get the total number of tuples in the specified data chunks considering factor
     #[inline]
-    pub fn get_num_tuples(&self, data_chunks_pos_in_scope: &HashSet<u32>) -> u64 {
-        self.get_num_tuples_without_multiplicity(data_chunks_pos_in_scope) * self.multiplicity
+    pub fn get_num_tuples(&self, data_chunks_pos_in_scope: &HashSet<DataChunkPos>) -> u64 {
+        self.get_num_tuples_without_factor(data_chunks_pos_in_scope) * self.factor
     }
 
     #[inline]
@@ -158,17 +149,48 @@ impl ResultSet {
     }
 }
 
-impl Default for ResultSet {
-    fn default() -> Self {
-        Self::new()
-    }
+#[macro_export]
+macro_rules! data_pos {
+    // From raw usize
+    ($chunk_idx:literal, $col_pos:expr) => {
+        DataPos {
+            data_chunk_pos: DataChunkPos($chunk_idx),
+            column_pos: $col_pos,
+        }
+    };
+    // Direct DataChunkPos
+    ($chunk_pos:expr, $col_pos:expr) => {
+        DataPos {
+            data_chunk_pos: $chunk_pos,
+            column_pos: $col_pos,
+        }
+    };
+}
+
+/// Create a ResultSet from DataChunks.
+/// Ensures exactly one chunk has cur_idx set.
+#[macro_export]
+macro_rules! result_set {
+    ($($chunk:expr),+ $(,)?) => {
+        {
+            let chunks = vec![$($chunk),+];
+            let chunks_with_cur_idx: Vec<_> = chunks.iter().filter(|chunk| chunk.cur_idx().is_some()).collect();
+            assert_eq!(chunks_with_cur_idx.len(), 1, "Exactly one chunk must have cur_idx set");
+
+            let mut result_set = $crate::result_set::ResultSet::new();
+            for chunk in chunks {
+                result_set.push(chunk);
+            }
+            result_set
+        }
+    };
 }
 
 impl FromIterator<DataChunk> for ResultSet {
     fn from_iter<T: IntoIterator<Item = DataChunk>>(iter: T) -> Self {
         let data_chunks = iter.into_iter().map(Arc::new).collect();
         Self {
-            multiplicity: 1,
+            factor: 1,
             data_chunks,
         }
     }
@@ -185,7 +207,7 @@ mod tests {
     fn test_result_set_basic() {
         let mut result_set = ResultSet::new();
         assert!(result_set.is_empty());
-        assert_eq!(result_set.multiplicity, 1);
+        assert_eq!(result_set.factor, 1);
 
         let chunk = data_chunk!((Int32, [1, 2, 3]));
         result_set.push(chunk);
@@ -194,38 +216,42 @@ mod tests {
 
     #[test]
     fn test_get_num_tuples() {
-        let mut result_set = ResultSet::new();
-        result_set.push(data_chunk!((Int32, [1, 2, 3]))); // 3 tuples
-        result_set.push(data_chunk!((Int32, [4, 5]))); // 2 tuples
-        result_set.multiplicity = 2;
+        let chunk1 = data_chunk!((Int32, [0, 1, 2]));
+        let mut chunk2 = data_chunk!((Int32, [1, 2, 3]));
+        chunk2.set_unflat();
+        let mut chunk3 = data_chunk!((Int32, [4, 5]));
+        chunk3.set_unflat();
+        let mut result_set = result_set!(chunk1, chunk2, chunk3);
+        result_set.factor = 2;
 
-        let scope = HashSet::from([0, 1]);
-        // Without multiplicity: 3 * 2 = 6 (Cartesian product)
-        assert_eq!(result_set.get_num_tuples_without_multiplicity(&scope), 6);
-        // With multiplicity: 6 * 2 = 12
-        assert_eq!(result_set.get_num_tuples(&scope), 12);
-    }
-
-    #[test]
-    fn test_get_num_tuples_without_multiplicity() {
-        let mut result_set = ResultSet::new();
-        result_set.push(data_chunk!((Int32, [1, 2, 3]))); // 3 tuples
-        result_set.push(data_chunk!((Int32, [4, 5]))); // 2 tuples
-        result_set.push(data_chunk!((Int32, [7]))); // 1 tuple
-
-        // Test single data chunk
-        let scope_single = HashSet::from([0]);
+        // flat chunk
         assert_eq!(
-            result_set.get_num_tuples_without_multiplicity(&scope_single),
+            result_set.get_num_tuples_without_factor(&HashSet::from([DataChunkPos(0)])),
+            1
+        );
+        // unflat chunk
+        assert_eq!(
+            result_set.get_num_tuples_without_factor(&HashSet::from([DataChunkPos(1)])),
             3
         );
-
-        // Test multiple data chunks (Cartesian product)
-        let scope_multiple = HashSet::from([0, 1, 2]);
+        // Without factor: 3 * 2 = 6 (Cartesian product)
         assert_eq!(
-            result_set.get_num_tuples_without_multiplicity(&scope_multiple),
+            result_set.get_num_tuples_without_factor(&HashSet::from([
+                DataChunkPos(0),
+                DataChunkPos(1),
+                DataChunkPos(2)
+            ])),
             6
-        ); // 3 * 2 * 1
+        );
+        // With factor: 6 * 2 = 12
+        assert_eq!(
+            result_set.get_num_tuples(&HashSet::from([
+                DataChunkPos(0),
+                DataChunkPos(1),
+                DataChunkPos(2)
+            ])),
+            12
+        );
     }
 
     #[test]

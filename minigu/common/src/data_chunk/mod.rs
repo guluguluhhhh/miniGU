@@ -32,7 +32,7 @@ impl DataChunk {
         Self {
             columns,
             filter: None,
-            cur_idx: None,
+            cur_idx: Some(0),
         }
     }
 
@@ -193,7 +193,7 @@ impl DataChunk {
         Self {
             columns,
             filter,
-            cur_idx: None,
+            cur_idx: Some(0),
         }
     }
 
@@ -215,7 +215,7 @@ impl DataChunk {
     /// Sets the chunk as unflat (cur_idx = None)
     #[inline]
     pub fn set_unflat(&mut self) {
-        self.cur_idx = None
+        self.cur_idx = None;
     }
 
     /// Checks if the chunk is unflat
@@ -283,7 +283,7 @@ impl DataChunk {
         Self {
             columns,
             filter: None,
-            cur_idx: None,
+            cur_idx: Some(0),
         }
     }
 
@@ -304,7 +304,7 @@ impl DataChunk {
         Self {
             columns,
             filter,
-            cur_idx: None,
+            cur_idx: Some(0),
         }
     }
 
