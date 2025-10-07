@@ -168,15 +168,11 @@ macro_rules! data_pos {
 }
 
 /// Create a ResultSet from DataChunks.
-/// Ensures exactly one chunk has cur_idx set.
 #[macro_export]
 macro_rules! result_set {
     ($($chunk:expr),+ $(,)?) => {
         {
             let chunks = vec![$($chunk),+];
-            let chunks_with_cur_idx: Vec<_> = chunks.iter().filter(|chunk| chunk.cur_idx().is_some()).collect();
-            assert_eq!(chunks_with_cur_idx.len(), 1, "Exactly one chunk must have cur_idx set");
-
             let mut result_set = $crate::result_set::ResultSet::new();
             for chunk in chunks {
                 result_set.push(chunk);
