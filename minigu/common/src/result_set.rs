@@ -147,6 +147,29 @@ impl ResultSet {
     pub fn iter(&self) -> impl Iterator<Item = &Arc<DataChunk>> {
         self.data_chunks.iter()
     }
+
+    #[inline]
+    pub fn remove_chunk(&mut self, pos: DataChunkPos) {
+        if pos.0 < self.data_chunks.len() {
+            self.data_chunks.swap_remove(pos.0);
+        }
+    }
+
+    /// Remove multiple chunks at once, avoiding index shifting issues
+    #[inline]
+    pub fn remove_multiple_chunks(&mut self, positions: &[DataChunkPos]) {
+        if positions.is_empty() {
+            return;
+        }
+
+        // Sort positions in descending order to avoid index shifting
+        let mut sorted_positions = positions.to_vec();
+        sorted_positions.sort_by(|a, b| b.0.cmp(&a.0));
+
+        for pos in sorted_positions {
+            self.remove_chunk(pos);
+        }
+    }
 }
 
 #[macro_export]

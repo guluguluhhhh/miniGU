@@ -1,9 +1,11 @@
 pub mod factorized_expand;
+pub mod factorized_flatten;
 pub mod factorized_project;
 pub mod factorized_simple_aggregate;
 pub mod factorized_transfer;
 
 use factorized_expand::FactorizedExpandBuilder;
+use factorized_flatten::FactorizedFlattenBuilder;
 pub use factorized_project::FactorizedProjectBuilder;
 use factorized_simple_aggregate::{FactorizedAggregateBuilder, SimpleAggregateSpec};
 pub use factorized_transfer::FactorizedTransferBuilder;
@@ -53,6 +55,16 @@ pub trait FactorizedExecutor {
         Self: Sized,
     {
         FactorizedProjectBuilder::new(self, evaluators).into_factorized_executor()
+    }
+
+    fn factorized_flatten(
+        self,
+        target_chunk_pos: minigu_common::result_set::DataChunkPos,
+    ) -> impl FactorizedExecutor
+    where
+        Self: Sized,
+    {
+        FactorizedFlattenBuilder::new(self, target_chunk_pos).into_factorized_executor()
     }
 }
 
