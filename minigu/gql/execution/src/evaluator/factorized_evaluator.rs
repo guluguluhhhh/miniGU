@@ -16,6 +16,10 @@ pub trait FactorizedEvaluator: Debug {
     /// Evaluate and return a chunk based on the ResultSet
     fn evaluate(&self, result_set: &ResultSet) -> ExecutionResult<DataChunk>;
 
+    fn get_data_pos(&self) -> Option<&DataPos> {
+        None
+    }
+
     fn add<E>(self, other: E) -> FactorizedBinary<Self, E>
     where
         Self: Sized,
@@ -75,6 +79,10 @@ impl FactorizedDataRef {
     pub fn new(data_pos: DataPos) -> Self {
         Self { data_pos }
     }
+
+    pub fn data_pos(&self) -> &DataPos {
+        &self.data_pos
+    }
 }
 
 #[macro_export]
@@ -98,6 +106,10 @@ impl FactorizedEvaluator for FactorizedDataRef {
         chunk.set_cur_idx(source_chunk.cur_idx());
 
         Ok(chunk)
+    }
+
+    fn get_data_pos(&self) -> Option<&DataPos> {
+        Some(&self.data_pos)
     }
 }
 
@@ -167,6 +179,21 @@ impl<L, R> FactorizedBinary<L, R> {
     pub fn new(op: BinaryOp, left: L, right: R) -> Self {
         Self { op, left, right }
     }
+
+    /// Check if both operands are DataRef pointing to the same chunk
+    fn check_same_chunk(&self) -> bool
+    where
+        L: FactorizedEvaluator,
+        R: FactorizedEvaluator,
+    {
+        if let (Some(left_pos), Some(right_pos)) =
+            (self.left.get_data_pos(), self.right.get_data_pos())
+        {
+            left_pos.data_chunk_pos == right_pos.data_chunk_pos
+        } else {
+            false
+        }
+    }
 }
 
 impl<L: FactorizedEvaluator, R: FactorizedEvaluator> FactorizedEvaluator
@@ -212,10 +239,17 @@ impl<L: FactorizedEvaluator, R: FactorizedEvaluator> FactorizedEvaluator
             }
             // unflat + unflat -> unflat
             (false, false) => {
-                let left_datum = DatumRef::new(left_col.clone(), false);
-                let right_datum = DatumRef::new(right_col.clone(), false);
-                let result = self.apply_op(&left_datum, &right_datum)?;
-                (result, false)
+                // Check if they are from the same chunk
+                if self.check_same_chunk() {
+                    let left_datum = DatumRef::new(left_col.clone(), false);
+                    let right_datum = DatumRef::new(right_col.clone(), false);
+                    let result = self.apply_op(&left_datum, &right_datum)?;
+                    (result, false)
+                } else {
+                    // Different chunks -> cartesian product
+                    let result = self.apply_cartesian_product(left_col, right_col)?;
+                    (result, false)
+                }
             }
         };
 
@@ -255,6 +289,41 @@ impl<L, R> FactorizedBinary<L, R> {
             BinaryOp::Le => Arc::new(cmp::lt_eq(left, right)?),
         };
         Ok(result)
+    }
+
+    /// Apply cartesian product for two unflat arrays from different chunks
+    fn apply_cartesian_product(
+        &self,
+        left_col: &ArrayRef,
+        right_col: &ArrayRef,
+    ) -> ExecutionResult<ArrayRef> {
+        let left_len = left_col.len();
+
+        // For each element in left, compute op with all elements in right
+        let mut all_results = Vec::new();
+        for i in 0..left_len {
+            let left_scalar = DatumRef::new(left_col.slice(i, 1), true);
+            let right_datum = DatumRef::new(right_col.clone(), false);
+            let result = self.apply_op(&left_scalar, &right_datum)?;
+            all_results.push(result);
+        }
+
+        // Concatenate all results
+        use arrow::compute::concat;
+        let all_results_refs: Vec<&dyn Array> =
+            all_results.iter().map(|arr| arr.as_ref()).collect();
+        let concatenated = concat(&all_results_refs)?;
+
+        Ok(concatenated)
+    }
+}
+
+impl<E> FactorizedEvaluator for Box<E>
+where
+    E: FactorizedEvaluator + ?Sized,
+{
+    fn evaluate(&self, result_set: &ResultSet) -> ExecutionResult<DataChunk> {
+        (**self).evaluate(result_set)
     }
 }
 
@@ -300,20 +369,44 @@ mod tests {
     }
 
     #[test]
-    fn test_unflat_plus_unflat() {
-        let mut chunk1 = data_chunk!((Int32, [1, 2, 3]));
-        chunk1.set_unflat();
-        let mut chunk2 = data_chunk!((Int32, [10, 20, 30]));
-        chunk2.set_unflat();
-        let result_set = result_set!(chunk1, chunk2);
+    fn test_unflat_in_same_chunk() {
+        // chunk (unflat): [1, 2, 3], [10, 20, 30]
+        // input_total_num_tuples = 3 * factor = 3 * 1 = 3
+        let c1 = create_array!(Int32, [1, 2, 3]);
+        let c2 = create_array!(Int32, [10, 20, 30]);
+        let mut chunk = DataChunk::new(vec![c1, c2]);
+        chunk.set_unflat();
+        let input_rs = result_set!(chunk);
 
         // unflat + unflat(in the same chunk): [1, 2, 3] * [10, 20, 30] = [10, 40, 90]
         let evaluator =
-            FactorizedDataRef::new(data_pos!(0, 0)).mul(FactorizedDataRef::new(data_pos!(1, 0)));
+            FactorizedDataRef::new(data_pos!(0, 0)).mul(FactorizedDataRef::new(data_pos!(0, 1)));
+
+        let result = evaluator.evaluate(&input_rs).unwrap();
+        assert!(result.is_unflat());
+        let expected = create_array!(Int32, [10, 40, 90]);
+        assert_eq!(result.columns()[0].as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn test_unflat_in_different_chunks() {
+        // chunk1 (unflat): [1, 2, 3]
+        let mut chunk1 = data_chunk!((Int32, [1, 2, 3]));
+        chunk1.set_unflat();
+
+        // chunk2 (unflat): [10, 20]
+        let mut chunk2 = data_chunk!((Int32, [10, 20]));
+        chunk2.set_unflat();
+
+        let result_set = result_set!(chunk1, chunk2);
+
+        // [1, 2, 3] + [10, 20] = [11, 21, 12, 22, 13, 23]
+        let evaluator =
+            FactorizedDataRef::new(data_pos!(0, 0)).add(FactorizedDataRef::new(data_pos!(1, 0)));
 
         let result = evaluator.evaluate(&result_set).unwrap();
         assert!(result.is_unflat());
-        let expected = create_array!(Int32, [10, 40, 90]);
+        let expected = create_array!(Int32, [11, 21, 12, 22, 13, 23]);
         assert_eq!(result.columns()[0].as_ref(), expected.as_ref());
     }
 
@@ -345,14 +438,5 @@ mod tests {
         assert!(result.is_unflat());
         let expected = create_array!(Int32, [10, 20, 30]);
         assert_eq!(result.columns()[0].as_ref(), expected.as_ref());
-    }
-}
-
-impl<E> FactorizedEvaluator for Box<E>
-where
-    E: FactorizedEvaluator + ?Sized,
-{
-    fn evaluate(&self, result_set: &ResultSet) -> ExecutionResult<DataChunk> {
-        (**self).evaluate(result_set)
     }
 }

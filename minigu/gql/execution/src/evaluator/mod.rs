@@ -9,7 +9,7 @@ pub mod unary;
 use std::fmt::Debug;
 
 use binary::{Binary, BinaryOp};
-pub use datum::DatumRef;
+use datum::DatumRef;
 use minigu_common::data_chunk::DataChunk;
 use unary::{Unary, UnaryOp};
 
